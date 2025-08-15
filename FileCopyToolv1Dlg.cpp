@@ -50,6 +50,13 @@ void CFileCopyToolv1Dlg::DoDataExchange(CDataExchange* pDX) {
 	CDialogEx::DoDataExchange(pDX);
 	DDX_Control(pDX, IDC_EDIT_SRCPATH, m_srcEdit);
 	DDX_Control(pDX, IDC_EDIT_DSTPATH, m_destEdit);
+	DDX_Control(pDX, IDC_STATIC_TOTALPROGRESS, m_totalProgressText);
+	DDX_Control(pDX, IDC_STATIC_TOTALSPEED, m_totalSpeedText);
+	DDX_Control(pDX, IDC_STATIC_ALREADYCOPY, m_alreadyCopyText);
+	DDX_Control(pDX, IDC_STATIC_REMAINTIME, m_remainTimeText);
+	DDX_Control(pDX, IDC_PROGRESS, m_progressBar);
+	DDX_Control(pDX, IDC_LIST_PROCESS, m_threadListCtrl);
+	DDX_Control(pDX, IDC_RICHEDIT_LOG, m_logRichEdit);
 }
 
 BEGIN_MESSAGE_MAP(CFileCopyToolv1Dlg, CDialogEx)
@@ -101,8 +108,7 @@ void CFileCopyToolv1Dlg::OnSysCommand(UINT nID, LPARAM lParam) {
 	if ((nID & 0xFFF0) == IDM_ABOUTBOX) {
 		CAboutDlg dlgAbout;
 		dlgAbout.DoModal();
-	}
-	else {
+	} else {
 		CDialogEx::OnSysCommand(nID, lParam);
 	}
 }
@@ -127,8 +133,7 @@ void CFileCopyToolv1Dlg::OnPaint() {
 
 		// 绘制图标
 		dc.DrawIcon(x, y, m_hIcon);
-	}
-	else {
+	} else {
 		CDialogEx::OnPaint();
 	}
 }
@@ -164,13 +169,25 @@ LRESULT CFileCopyToolv1Dlg::OnPreparationComplete(WPARAM wParam, LPARAM lParam) 
 	UINT totalFiles = static_cast<UINT>(wParam);
 	// lParam 可以用来传递文件总大小
 	ULONGLONG totalSize = static_cast<ULONGLONG>(lParam);
+	if (totalSize >= 1024 * 1024 * 1024) {
+		m_filesAllSizeText.Format(_T("%.2f GB"), totalSize / (1024.0 * 1024.0 * 1024.0));
+	} else if (totalSize >= 1024 * 1024) {
+		m_filesAllSizeText.Format(_T("%.2f MB"), totalSize / (1024.0 * 1024.0));
+	} else if (totalSize >= 1024) {
+		m_filesAllSizeText.Format(_T("%.2f KB"), totalSize / 1024.0);
+	} else {
+		m_filesAllSizeText.Format(_T("%u B"), totalSize);
+	}
 
-	// 在这里更新UI，比如设置进度条的最大值，显示总文件数等
-	// m_progress.SetRange32(0, 100);
-	// CString statusText;
-	// statusText.Format(_T("共 %u 个文件，总大小 %.2f GB"), totalFiles, totalSize / (1024.0*1024.0*1024.0));
-	// m_statusStatic.SetWindowText(statusText);
-
+	m_progressBar.SetRange32(0, 100);
+	CString statusText = _T("0 B/");
+	statusText += m_filesAllSizeText;
+	statusText += _T("  0/");
+	CString fileCountText;
+	fileCountText.Format(_T("%u个"), totalFiles);
+	statusText += fileCountText;
+	m_alreadyCopyText.SetWindowText(statusText);
+	m_totalProgressText.SetWindowText(_T("0%"));
 	return 0;
 }
 
@@ -189,7 +206,7 @@ LRESULT CFileCopyToolv1Dlg::OnCopyComplete(WPARAM wParam, LPARAM lParam) {
 		AfxMessageBox(_T("复制过程中发生错误，请检查日志。"));
 		break;
 	}
-
+	m_pCopyController->ResetStatus();
 	// 恢复UI界面到初始状态（启用“开始”按钮等）
 	// m_startButton.EnableWindow(TRUE);
 	// m_pauseButton.EnableWindow(FALSE);

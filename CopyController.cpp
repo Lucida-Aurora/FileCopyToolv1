@@ -1,7 +1,7 @@
 #include "pch.h"
 #include "CopyController.h"
 
-CCopyController::CCopyController() : m_threadCount(0), m_hNotifyWnd(nullptr), m_status(CopyStatus::Idle), m_bCancelSignal(false) {
+CCopyController::CCopyController() : m_threadCount(0), m_hNotifyWnd(nullptr), m_status(ECopyStatus::Idle), m_bCancelSignal(false) {
 	m_hResumeEvent = CreateEvent(nullptr, TRUE, TRUE, nullptr);
 	if (m_hResumeEvent == nullptr) {
 		throw std::runtime_error("Failed to create resume event");
@@ -14,48 +14,57 @@ CCopyController::~CCopyController() {
 
 bool CCopyController::StartCopy(const CString& source, const CString& dest, HWND wnd, UINT threadCount) {
 	//防止重复启动复制任务
-	if (m_status.load() != CopyStatus::Idle) {
+	if (m_status.load() != ECopyStatus::Idle) {
 		return false;
 	}
 	m_srcPath = source;
 	m_destPath = dest;
 	m_hNotifyWnd = wnd;
 	m_threadCount = threadCount > 0 ? threadCount : 1;
-	m_status.store(CopyStatus::Preparing);
+	m_status.store(ECopyStatus::Preparing);
+	m_threadCompletedEvents.resize(m_threadCount);
+	for (int i = 0; i < m_threadCount; i++) {
+		m_threadCompletedEvents[i] = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+	}
 	// 创建准备线程
 	AfxBeginThread(PreparationThreadProc, this);
+	AfxBeginThread(MonitorCompleteThreadProc, this);
 	return true;
 }
 
 void CCopyController::PauseCopy() {
-	if (m_status.load() == CopyStatus::Copying) {
+	if (m_status.load() == ECopyStatus::Copying) {
 		ResetEvent(m_hResumeEvent);
-		m_status.store(CopyStatus::Paused);
+		m_status.store(ECopyStatus::Paused);
 	}
 }
 
 void CCopyController::ResumeCopy() {
-	if (m_status.load() == CopyStatus::Paused) {
+	if (m_status.load() == ECopyStatus::Paused) {
 		SetEvent(m_hResumeEvent);
-		m_status.store(CopyStatus::Copying);
+		m_status.store(ECopyStatus::Copying);
 	}
 }
 
 void CCopyController::CancelCopy() {
 	m_bCancelSignal.store(true);
-	if (m_status.load() == CopyStatus::Paused) {
+	if (m_status.load() == ECopyStatus::Paused) {
 		ResumeCopy();
 	}
-	m_status.store(CopyStatus::Cancelling);
+	m_status.store(ECopyStatus::Cancelling);
 }
 
-CopyStatus CCopyController::GetStatus() const {
-	if (m_status.load() == CopyStatus::Copying && (m_sharedStats.completedFileCount + m_sharedStats.failedFileCount) == m_sharedStats.totalFileCount) {
+ECopyStatus CCopyController::GetStatus() const {
+	if (m_status.load() == ECopyStatus::Copying && (m_sharedStats.completedFileCount + m_sharedStats.failedFileCount) == m_sharedStats.totalFileCount) {
 		// 注意：这里有竞态条件风险，仅用于演示。
 		// 更好的做法是在工作线程发现任务完成时发送消息通知UI。
 		// const_cast<std::atomic<CopyStatus>&>(m_status).store(CopyStatus::Finished);
 	}
 	return m_status.load();
+}
+
+void CCopyController::ResetStatus() {
+	m_status.store(ECopyStatus::Idle);
 }
 
 const SSharedStats& CCopyController::GetSharedStats() const {
@@ -64,13 +73,13 @@ const SSharedStats& CCopyController::GetSharedStats() const {
 
 void CCopyController::_PreparationThread() {
 	if (!_ScanFiles(m_srcPath, m_destPath)) {
-		m_status.store(CopyStatus::Error);
+		m_status.store(ECopyStatus::Error);
 		//todo: 通知UI准备失败
 		//::PostMessage(m_hNotifyWnd, WM_COPY_PREPARATION_FAILED, 0, 0);
 		return;
 	}
 	if (m_allFiles.empty()) {
-		m_status.store(CopyStatus::Finished);
+		m_status.store(ECopyStatus::Finished);
 		//todo: 通知UI没有文件需要复制
 		//::PostMessage(m_hNotifyWnd, WM_COPY_NO_FILES, 0, 0);
 		return;
@@ -79,7 +88,7 @@ void CCopyController::_PreparationThread() {
 	_DistributeFiles();
 	// 启动工作线程
 	_LaunchWorkerThreads();
-	m_status.store(CopyStatus::Copying);
+	m_status.store(ECopyStatus::Copying);
 }
 
 bool CCopyController::_ScanFiles(const CString& source, const CString& dest) {
@@ -94,8 +103,7 @@ bool CCopyController::_ScanFiles(const CString& source, const CString& dest) {
 			CreateDirectory(dest, nullptr);
 		}
 		_RecursiveScan(source, dest);
-	}
-	else {
+	} else {
 		SFileInfo fileInfo;
 		fileInfo.sourcePath = source;
 		CString finalDestPath = dest;
@@ -117,6 +125,7 @@ bool CCopyController::_ScanFiles(const CString& source, const CString& dest) {
 		m_sharedStats.totalCopySize += file.fileSize;
 	}
 	m_sharedStats.totalFileCount = m_allFiles.size();
+	PostMessage(m_hNotifyWnd, WM_USER_PREPARATION_COMPLETE, m_sharedStats.totalFileCount, m_sharedStats.totalCopySize);
 	return true;
 }
 
@@ -135,8 +144,7 @@ void CCopyController::_RecursiveScan(const CString& currentSrcDir, const CString
 		if (finder.IsDirectory()) {
 			CreateDirectory(destFilePath, nullptr);
 			_RecursiveScan(sourceFilePath, destFilePath);
-		}
-		else {
+		} else {
 			SFileInfo fileInfo;
 			fileInfo.sourcePath = sourceFilePath;
 			fileInfo.destPath = destFilePath;
@@ -170,11 +178,15 @@ void CCopyController::_LaunchWorkerThreads() {
 }
 
 void CCopyController::_Cleanup() {
+	for (int i = 0; i < m_threadCount; i++) {
+		SetEvent(m_threadCompletedEvents[i]);
+	}
 	for (CWinThread* pThread : m_threads) {
 		if (pThread) {
 			WaitForSingleObject(pThread->m_hThread, INFINITE);
 		}
 	}
+
 	m_threads.clear();
 	if (m_hResumeEvent) {
 		CloseHandle(m_hResumeEvent);
@@ -209,14 +221,23 @@ UINT CCopyController::CopyWorkerThreadProc(LPVOID param) {
 		if (CopyFile(pFile->sourcePath, pFile->destPath, FALSE)) {
 			pFile->status.store(EFileStatus::Completed);
 			++pSharedStats->completedFileCount;
-		}
-		else {
+		} else {
 			pFile->status.store(EFileStatus::Failed);
 			++pSharedStats->failedFileCount;
 			//todo: 记录日志文件复制失败
 		}
 	}
 	--pSharedStats->activeCopyThreads;
+	SetEvent(pController->m_threadCompletedEvents[pThreadParam->threadId - 1]);
 	delete pThreadParam;
+	return 0;
+}
+
+UINT CCopyController::MonitorCompleteThreadProc(LPVOID param) {
+	CCopyController* pThis = static_cast<CCopyController*>(param);
+	DWORD dwRet = WaitForMultipleObjects(pThis->m_threadCount, pThis->m_threadCompletedEvents.data(), TRUE, INFINITE);
+	if (dwRet == WAIT_OBJECT_0) {
+		PostMessage(pThis->m_hNotifyWnd, WM_USER_COPY_COMPLETE, 0, 0);
+	}
 	return 0;
 }

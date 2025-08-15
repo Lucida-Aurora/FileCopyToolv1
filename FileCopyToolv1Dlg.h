@@ -3,25 +3,8 @@
 
 #pragma once
 #include "CopyController.h"
+#include "common.h"
 
-#define WM_USER_PREPARATION_COMPLETE (WM_USER + 1) // 准备工作完成
-#define WM_USER_COPY_COMPLETE        (WM_USER + 2) // 整个复制任务完成
-#define WM_USER_LOG_MESSAGE          (WM_USER + 3) // 添加一条日志消息
-
-// 定义日志消息的类型（用于设置颜色）
-enum class ELogLevel {
-	Info,
-	Success,
-	Warning,
-	Error
-};
-// 这是我们用来通过WM_USER_LOG_MESSAGE传递日志信息的结构体
-// 工作线程会在堆上 new 一个，然后把指针作为LPARAM发送
-// UI线程收到后负责 delete
-struct LogMessage {
-	CStringW text;
-	LogLevel level;
-};
 // CFileCopyToolv1Dlg 对话框
 class CFileCopyToolv1Dlg : public CDialogEx {
 	// 构造
@@ -57,4 +40,12 @@ public:
 	CEdit m_destEdit;
 	std::unique_ptr<CCopyController> m_pCopyController;
 	afx_msg void OnBnClickedButtonStartcopy();
+	CStatic m_totalProgressText;
+	CStatic m_totalSpeedText;
+	CStatic m_alreadyCopyText;
+	CStatic m_remainTimeText;
+	CProgressCtrl m_progressBar;
+	CListCtrl m_threadListCtrl;
+	CRichEditCtrl m_logRichEdit;
+	CString m_filesAllSizeText;
 };

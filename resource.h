@@ -12,6 +12,7 @@
 #define IDC_BUTTON_SCANSRC              1002
 #define IDC_BUTTON_SCANDST              1003
 #define IDC_PROGRESS1                   1004
+#define IDC_PROGRESS                    1004
 #define IDC_LIST_PROCESS                1005
 #define IDC_RICHEDIT_LOG                1006
 #define IDC_STATIC_TOTALSPEED           1007

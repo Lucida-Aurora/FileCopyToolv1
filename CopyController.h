@@ -7,7 +7,7 @@
 
 class CCopyController;
 
-enum class CopyStatus {
+enum class ECopyStatus {
 	Idle,        // 空闲
 	Preparing,   // 正在准备 (扫描文件)
 	Copying,     // 正在复制
@@ -31,7 +31,7 @@ class CCopyController {
 	UINT m_threadCount; // 线程数量
 	HWND m_hNotifyWnd; // 通知窗口句柄
 
-	std::atomic<CopyStatus> m_status{ CopyStatus::Idle }; // 当前任务状态
+	std::atomic<ECopyStatus> m_status{ ECopyStatus::Idle }; // 当前任务状态
 	std::atomic<bool> m_bCancelSignal{ false }; // 是否取消复制
 	HANDLE m_hResumeEvent;
 	SSharedStats m_sharedStats; // 共享统计信息
@@ -39,6 +39,7 @@ class CCopyController {
 	std::vector<std::vector<SFileInfo*>> m_threadFileLists; // 每个线程的文件列表
 	std::vector<SThreadParam*> m_threadParams; // 线程参数列表
 	std::vector<CWinThread*> m_threads; // 线程列表
+	std::vector<HANDLE> m_threadCompletedEvents; // 线程列表
 public:
 	CCopyController();
 	~CCopyController();
@@ -47,7 +48,8 @@ public:
 	void ResumeCopy();
 	void CancelCopy();
 	// 获取当前任务状态
-	CopyStatus GetStatus() const;
+	ECopyStatus GetStatus() const;
+	void ResetStatus();
 	const SSharedStats& GetSharedStats() const;
 private:
 	void _PreparationThread();
@@ -58,4 +60,5 @@ private:
 	void _Cleanup();
 	static UINT AFX_CDECL PreparationThreadProc(LPVOID param);
 	static UINT AFX_CDECL CopyWorkerThreadProc(LPVOID param);
+	static UINT AFX_CDECL MonitorCompleteThreadProc(LPVOID param);
 };
