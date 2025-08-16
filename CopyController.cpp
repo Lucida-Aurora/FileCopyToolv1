@@ -1,6 +1,10 @@
 #include "pch.h"
 #include "CopyController.h"
 
+// 定义大文件的阈值和切片大小
+const ULONGLONG LARGE_FILE_THRESHOLD = 128 * 1024 * 1024; // 128 MB
+const ULONGLONG CHUNK_SIZE = 32 * 1024 * 1024;             // 32 MB
+
 CCopyController::CCopyController() : m_threadCount(0), m_hNotifyWnd(nullptr), m_status(ECopyStatus::Idle), m_bCancelSignal(false) {
 	m_hResumeEvent = CreateEvent(nullptr, TRUE, TRUE, nullptr);
 	if (m_hResumeEvent == nullptr) {
@@ -69,18 +73,17 @@ const SSharedStats& CCopyController::GetSharedStats() const {
 void CCopyController::_PreparationThread() {
 	if (!_ScanFiles(m_srcPath, m_destPath)) {
 		m_status.store(ECopyStatus::Error);
-		//todo: 通知UI准备失败
-		//::PostMessage(m_hNotifyWnd, WM_COPY_PREPARATION_FAILED, 0, 0);
+		PostMessage(m_hNotifyWnd, WM_USER_COPY_COMPLETE, 2, 0);
 		return;
 	}
 	if (m_allFiles.empty()) {
 		m_status.store(ECopyStatus::Finished);
-		//todo: 通知UI没有文件需要复制
-		//::PostMessage(m_hNotifyWnd, WM_COPY_NO_FILES, 0, 0);
+		PostMessage(m_hNotifyWnd, WM_USER_COPY_COMPLETE, 0, 0);
 		return;
 	}
 	// 分配文件到线程
-	_DistributeFiles();
+	//_DistributeFiles();
+	_GenerateTasks();
 	// 启动工作线程
 	_LaunchWorkerThreads();
 	m_status.store(ECopyStatus::Copying);
@@ -98,8 +101,7 @@ bool CCopyController::_ScanFiles(const CString& source, const CString& dest) {
 			CreateDirectory(dest, nullptr);
 		}
 		_RecursiveScan(source, dest);
-	}
-	else {
+	} else {
 		SFileInfo fileInfo;
 		fileInfo.sourcePath = source;
 		CString finalDestPath = dest;
@@ -140,8 +142,7 @@ void CCopyController::_RecursiveScan(const CString& currentSrcDir, const CString
 		if (finder.IsDirectory()) {
 			CreateDirectory(destFilePath, nullptr);
 			_RecursiveScan(sourceFilePath, destFilePath);
-		}
-		else {
+		} else {
 			SFileInfo fileInfo;
 			fileInfo.sourcePath = sourceFilePath;
 			fileInfo.destPath = destFilePath;
@@ -152,32 +153,105 @@ void CCopyController::_RecursiveScan(const CString& currentSrcDir, const CString
 	finder.Close();
 }
 
-void CCopyController::_DistributeFiles() {
-	m_threadFileLists.resize(m_threadCount);
-	for (int i = 0; i < m_allFiles.size(); ++i) {
-		m_threadFileLists[i % m_threadCount].push_back(&m_allFiles[i]);
+void CCopyController::_GenerateTasks() {
+	for (const auto& fileInfo : m_allFiles) {
+		if (fileInfo.fileSize > LARGE_FILE_THRESHOLD) {
+			// --- 大文件处理逻辑：切片 ---
+
+			// 1. 预先创建目标文件并设定大小
+			HANDLE hFile = CreateFile(fileInfo.destPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+			if (hFile == INVALID_HANDLE_VALUE) {
+				// 处理错误，可以记录日志并跳过
+				continue;
+			}
+			LARGE_INTEGER li;
+			li.QuadPart = fileInfo.fileSize;
+			SetFilePointerEx(hFile, li, NULL, FILE_BEGIN);
+			SetEndOfFile(hFile);
+			CloseHandle(hFile);
+
+			SChunkFileInfo* chunkFileInfo = new SChunkFileInfo;
+
+			// 2. 生成切片任务并推入队列
+			for (ULONGLONG offset = 0; offset < fileInfo.fileSize; offset += CHUNK_SIZE) {
+				ULONGLONG currentChunkSize = min(CHUNK_SIZE, fileInfo.fileSize - offset);
+				++chunkFileInfo->remainCopiedCount;
+				m_taskQueue.Push({ ETaskType::FILE_CHUNK,
+					fileInfo.sourcePath,
+					fileInfo.destPath,
+					fileInfo.fileSize,
+					offset,
+					currentChunkSize,
+					chunkFileInfo });
+			}
+		} else {
+			// --- 小文件处理逻辑：整个复制 ---
+			m_taskQueue.Push({ ETaskType::WHOLE_FILE, fileInfo.sourcePath, fileInfo.destPath, fileInfo.fileSize });
+		}
 	}
+	// 通知队列：所有任务已经生成完毕
+	m_taskQueue.Finished();
+}
+
+bool CCopyController::_CopyFileChunk(const SCopyTask& task, SSharedStats* pSharedStats) {
+	HANDLE hSource = CreateFile(task.sourcePath,
+		GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+	if (hSource == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	HANDLE hDest = CreateFile(task.destPath,
+		GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL);
+	if (hDest == INVALID_HANDLE_VALUE) {
+		CloseHandle(hSource);
+		return false;
+	}
+	LARGE_INTEGER sourceOffset, destOffset;
+	sourceOffset.QuadPart = task.offset;
+	destOffset.QuadPart = task.offset;
+
+	if (!SetFilePointerEx(hSource,
+		sourceOffset, NULL, FILE_BEGIN) || !SetFilePointerEx(hDest, destOffset, NULL, FILE_BEGIN)) {
+		CloseHandle(hSource);
+		CloseHandle(hDest);
+		return false;
+	}
+	const DWORD bufferSize = 65536; // 64KB
+	std::vector<char> buffer(bufferSize);
+	ULONGLONG bytesRemaining = task.chunkSize;
+	BOOL bSuccess = TRUE;
+	while (bytesRemaining > 0) {
+		DWORD bytesToRead = static_cast<DWORD>(min((ULONGLONG)bufferSize, bytesRemaining));
+		DWORD bytesRead, bytesWritten;
+
+		if (!ReadFile(hSource, buffer.data(), bytesToRead, &bytesRead, NULL) || bytesRead == 0) {
+			bSuccess = FALSE;
+			break;
+		}
+		if (!WriteFile(hDest, buffer.data(), bytesRead, &bytesWritten, NULL) || bytesRead != bytesWritten) {
+			bSuccess = FALSE;
+			break;
+		}
+
+		pSharedStats->totalBytesCopied += bytesWritten;
+		bytesRemaining -= bytesWritten;
+	}
+	--task.chunkFileInfo->remainCopiedCount;
+	CloseHandle(hSource);
+	CloseHandle(hDest);
+	return true;
 }
 
 void CCopyController::_LaunchWorkerThreads() {
-	for (int i = 0; i < m_threadCount; ++i) {
+	for (UINT i = 0; i < m_threadCount; ++i) {
 		SThreadParam* pParam = new SThreadParam();
 		pParam->threadId = i + 1;
-		pParam->hNotifyWnd = m_hNotifyWnd;
-		pParam->pSharedStats = &m_sharedStats;
-		pParam->pFilesToCopy = &m_threadFileLists[i];
 		pParam->pController = this;
 		m_threadParams.push_back(pParam);
-
-		CWinThread* pThread = AfxBeginThread(CopyWorkerThreadProc, pParam);
-		m_threads.push_back(pThread);
+		m_threads.push_back(AfxBeginThread(CopyWorkerThreadProc, pParam));
 	}
 }
 
 void CCopyController::_Cleanup() {
-	//for (int i = 0; i < m_threadCount; i++) {
-	//	SetEvent(m_threadCompletedEvents[i]);
-	//}
 	for (CWinThread* pThread : m_threads) {
 		if (pThread) {
 			WaitForSingleObject(pThread->m_hThread, INFINITE);
@@ -192,7 +266,6 @@ void CCopyController::_Cleanup() {
 	m_threadParams.clear();
 
 	m_allFiles.clear();
-	m_threadFileLists.clear();
 }
 
 UINT CCopyController::PreparationThreadProc(LPVOID param) {
@@ -209,8 +282,8 @@ UINT CCopyController::CopyWorkerThreadProc(LPVOID param) {
 		return 1;
 	}
 	CCopyController* pController = pThreadParam->pController;
-	SSharedStats* pSharedStats = pThreadParam->pSharedStats;
-	HWND hNotifyWnd = pThreadParam->hNotifyWnd;
+	SSharedStats* pSharedStats = pController->GetSharedStatsPtr();
+	HWND hNotifyWnd = pController->GetNotifyWnd();
 	UINT threadId = pThreadParam->threadId;
 	++pSharedStats->activeCopyThreads;
 	CString logMsg;
@@ -218,45 +291,61 @@ UINT CCopyController::CopyWorkerThreadProc(LPVOID param) {
 
 	LogMessage* pLogStart = new LogMessage{ logMsg, ELogLevel::Info };
 	PostMessage(hNotifyWnd, WM_USER_LOG_MESSAGE, 0, reinterpret_cast<LPARAM>(pLogStart));
-	for (SFileInfo* pFile : *pThreadParam->pFilesToCopy) {
-		WaitForSingleObject(pController->m_hResumeEvent, INFINITE);
-		if (pController->m_bCancelSignal) break;
-		pFile->status.store(EFileStatus::InProgress);
 
-		CString fileName = PathFindFileName(pFile->sourcePath);
+	SCopyTask currentTask;
+	while (pController->m_taskQueue.Pop(currentTask)) {
+		WaitForSingleObject(pController->GetResumeEvent(), INFINITE);
+		if (*pController->GetCancelSignalPtr()) break;
+
+		CString fileName = PathFindFileName(currentTask.sourcePath);
 		SThreadStatusInfo* pStatusInfo = new SThreadStatusInfo{ threadId, _T("复制中"), fileName };
 		PostMessage(hNotifyWnd, WM_USER_UPDATE_THREAD_STATUS, 0, reinterpret_cast<LPARAM>(pStatusInfo));
-		logMsg.Format(_T("线程%u开始复制："), threadId);
-		logMsg += fileName;
-		LogMessage* pLogCopy = new LogMessage{ logMsg, ELogLevel::Info };
-		PostMessage(hNotifyWnd, WM_USER_LOG_MESSAGE, 0, reinterpret_cast<LPARAM>(pLogCopy));
-		SCopyProgressContext progressCtx;
-		progressCtx.pSharedStats = pSharedStats;
-		progressCtx.lastCopied = 0;
-		BOOL bSuccess = CopyFileEx(
-			pFile->sourcePath,
-			pFile->destPath,
-			(LPPROGRESS_ROUTINE)CopyProgressRoutine, // 我们的回调函数
-			&progressCtx,                            // 传递本次复制的独立上下文
-			&(pController->m_bCancelSignal),         // 传递取消信号的地址
-			0);                                      // 默认标志
-		if (bSuccess) {
-			pFile->status.store(EFileStatus::Completed);
-			++pSharedStats->completedFileCount;
-			LogMessage* pLogSuccess = new LogMessage{ fileName + _T(" 复制成功。"), ELogLevel::Success };
-			PostMessage(hNotifyWnd, WM_USER_LOG_MESSAGE, 0, reinterpret_cast<LPARAM>(pLogSuccess));
-		}
-		else {
-			pFile->status.store(EFileStatus::Failed);
-			++pSharedStats->failedFileCount;
-			LogMessage* pLogError = new LogMessage{ fileName + _T(" 复制失败。"), ELogLevel::Error };
-			PostMessage(hNotifyWnd, WM_USER_LOG_MESSAGE, 0, reinterpret_cast<LPARAM>(pLogError));
+
+		BOOL bSuccess = FALSE;
+		if (currentTask.type == ETaskType::WHOLE_FILE) {
+			// --- 处理小文件 ---
+			SCopyProgressContext progressCtx;
+			progressCtx.pSharedStats = pSharedStats;
+			progressCtx.lastCopied = 0;
+			bSuccess = CopyFileEx(currentTask.sourcePath, currentTask.destPath,
+				(LPPROGRESS_ROUTINE)CopyProgressRoutine, &progressCtx,
+				pController->GetCancelSignalPtr(), 0);
+
+			if (bSuccess) {
+				++pSharedStats->completedFileCount;
+				LogMessage* pLogSuccess = new LogMessage{ fileName + _T(" 复制成功。"), ELogLevel::Success };
+				PostMessage(hNotifyWnd, WM_USER_LOG_MESSAGE, 0, reinterpret_cast<LPARAM>(pLogSuccess));
+			} else {
+				// 如果是因为取消而失败，不计入失败统计
+				if (!(*pController->GetCancelSignalPtr())) {
+					++pSharedStats->failedFileCount;
+					LogMessage* pLogError = new LogMessage{ fileName + _T(" 复制失败。"), ELogLevel::Error };
+					PostMessage(hNotifyWnd, WM_USER_LOG_MESSAGE, 0, reinterpret_cast<LPARAM>(pLogError));
+				}
+			}
+		} else if (currentTask.type == ETaskType::FILE_CHUNK) {
+			// --- 处理大文件块 ---
+			bSuccess = _CopyFileChunk(currentTask, pSharedStats);
+			if (bSuccess && currentTask.chunkFileInfo->remainCopiedCount.load() == 0) {
+				++pSharedStats->completedFileCount;
+				delete currentTask.chunkFileInfo;
+				LogMessage* pLogSuccess = new LogMessage{ fileName + _T(" 复制成功。"), ELogLevel::Success };
+				PostMessage(hNotifyWnd, WM_USER_LOG_MESSAGE, 0, reinterpret_cast<LPARAM>(pLogSuccess));
+			}
+			if (bSuccess == false) {
+				//delete currentTask.chunkFileInfo;
+				LogMessage* pLogError = new LogMessage{ fileName + _T(" 复制失败。"), ELogLevel::Error };
+				PostMessage(hNotifyWnd, WM_USER_LOG_MESSAGE, 0, reinterpret_cast<LPARAM>(pLogError));
+			}
 		}
 	}
-	SThreadStatusInfo* pStatusDone = new SThreadStatusInfo{ threadId, L"完成", L"" };
+	SThreadStatusInfo* pStatusDone = new SThreadStatusInfo{ threadId, _T("完成"), _T("") };
 	PostMessage(hNotifyWnd, WM_USER_UPDATE_THREAD_STATUS, 0, reinterpret_cast<LPARAM>(pStatusDone));
+
+	// 如果是最后一个完成的线程，则发送完成消息
 	if (pSharedStats->activeCopyThreads.fetch_sub(1) == 1) {
-		PostMessage(hNotifyWnd, WM_USER_COPY_COMPLETE, 0, 0);
+		int finalStatus = *pController->GetCancelSignalPtr() ? 1 : 0; // 1=取消, 0=成功
+		PostMessage(hNotifyWnd, WM_USER_COPY_COMPLETE, finalStatus, 0);
 	}
 	delete pThreadParam;
 	return 0;

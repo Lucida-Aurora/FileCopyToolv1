@@ -4,6 +4,9 @@
 #include <vector>
 
 #include "common.h"
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 
 class CCopyController;
 
@@ -26,10 +29,48 @@ struct SCopyProgressContext {
 
 struct SThreadParam {
 	UINT threadId;  //线程ID, 主要用户日志记录
-	HWND hNotifyWnd; //通知窗口句柄, 用户PostMessage通知UI更新
-	SSharedStats* pSharedStats; //共享统计信息
-	std::vector<SFileInfo*>* pFilesToCopy; //文件列表
 	CCopyController* pController;
+};
+
+
+template<typename T>
+class CTaskQueue {
+	std::queue<T> m_queue;
+	std::mutex m_mutex;
+	std::condition_variable m_cond;
+	bool m_isFinished = false;
+public:
+	void Push(T value) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_queue.push(std::move(value));
+		m_cond.notify_one();
+	}
+
+	bool Pop(T& value) {
+		std::unique_lock<std::mutex> lock(m_mutex);
+		m_cond.wait(lock, [this] {
+			return !m_queue.empty() || m_isFinished;
+			});
+		if (m_queue.empty() && m_isFinished) {
+			return false;
+		}
+		value = std::move(m_queue.front());
+		m_queue.pop();
+		return true;
+	}
+	void Finished() {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_isFinished = true;
+		m_cond.notify_all();
+	}
+
+	void Reset() {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_isFinished = false;
+		// 清空队列
+		std::queue<T> empty;
+		m_queue.swap(empty);
+	}
 };
 
 class CCopyController {
@@ -43,7 +84,8 @@ class CCopyController {
 	HANDLE m_hResumeEvent;
 	SSharedStats m_sharedStats; // 共享统计信息
 	std::vector<SFileInfo> m_allFiles; // 待复制文件列表
-	std::vector<std::vector<SFileInfo*>> m_threadFileLists; // 每个线程的文件列表
+	//std::vector<std::vector<SFileInfo*>> m_threadFileLists; // 每个线程的文件列表
+	CTaskQueue<SCopyTask> m_taskQueue;
 	std::vector<SThreadParam*> m_threadParams; // 线程参数列表
 	std::vector<CWinThread*> m_threads; // 线程列表
 public:
@@ -57,11 +99,21 @@ public:
 	ECopyStatus GetStatus() const;
 	void ResetStatus();
 	const SSharedStats& GetSharedStats() const;
+
+
+	HANDLE GetResumeEvent() const { return m_hResumeEvent; }
+	BOOL* GetCancelSignalPtr() { return &m_bCancelSignal; }
+	SSharedStats* GetSharedStatsPtr() { return &m_sharedStats; }
+	HWND GetNotifyWnd() const { return m_hNotifyWnd; }
 private:
 	void _PreparationThread();
 	bool _ScanFiles(const CString& source, const CString& dest);
 	void _RecursiveScan(const CString& currentSrcDir, const CString& currentDstDir);
-	void _DistributeFiles();
+
+	void _GenerateTasks();
+	static bool _CopyFileChunk(const SCopyTask& task, SSharedStats* pSharedStats);
+
+
 	void _LaunchWorkerThreads();
 	void _Cleanup();
 	static UINT AFX_CDECL PreparationThreadProc(LPVOID param);

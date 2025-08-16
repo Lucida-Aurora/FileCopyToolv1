@@ -9,6 +9,28 @@
 #define WM_USER_LOG_MESSAGE          (WM_USER + 3) // 添加一条日志消息
 #define WM_USER_UPDATE_THREAD_STATUS (WM_USER + 4) // 更新一个线程的状态
 
+// 任务类型：是复制整个小文件，还是大文件的一个数据块
+enum class ETaskType {
+	WHOLE_FILE,
+	FILE_CHUNK
+};
+struct SChunkFileInfo {
+	std::atomic<UINT> remainCopiedCount{ 0 };
+};
+
+// 任务结构体，描述一个具体的复制任务
+struct SCopyTask {
+	ETaskType type;          // 任务类型
+	CString sourcePath;      // 源文件路径
+	CString destPath;        // 目标文件路径
+	ULONGLONG fileSize;      // 文件总大小 (两种任务都需要)
+	ULONGLONG offset = 0;    // 数据块的起始位置 (仅 FILE_CHUNK 需要)
+	ULONGLONG chunkSize = 0; // 数据块的大小 (仅 FILE_CHUNK 需要)
+	SChunkFileInfo* chunkFileInfo = nullptr;
+};
+
+
+
 enum class EFileStatus {
 	Pending,   // 等待处理
 	InProgress, // 正在处理
