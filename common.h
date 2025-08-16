@@ -7,7 +7,7 @@
 #define WM_USER_PREPARATION_COMPLETE (WM_USER + 1) // 准备工作完成
 #define WM_USER_COPY_COMPLETE        (WM_USER + 2) // 整个复制任务完成
 #define WM_USER_LOG_MESSAGE          (WM_USER + 3) // 添加一条日志消息
-
+#define WM_USER_UPDATE_THREAD_STATUS (WM_USER + 4) // 更新一个线程的状态
 
 enum class EFileStatus {
 	Pending,   // 等待处理
@@ -51,7 +51,6 @@ struct SSharedStats {
 	std::mutex logMutex;
 };
 
-
 // 定义日志消息的类型（用于设置颜色）
 enum class ELogLevel {
 	Info,
@@ -65,4 +64,11 @@ enum class ELogLevel {
 struct LogMessage {
 	CStringW text;
 	ELogLevel level;
+};
+
+// 用于传递线程状态更新信息的数据结构
+struct SThreadStatusInfo {
+	UINT     threadId;       // 线程ID (从1开始)
+	CStringW statusText;     // 状态文本，如 "复制中", "完成"
+	CStringW currentFile;    // 当前正在处理的文件名
 };

@@ -36,6 +36,9 @@ public:
 	afx_msg LRESULT OnPreparationComplete(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnCopyComplete(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnLogMessage(WPARAM wParam, LPARAM lParam);
+	afx_msg LRESULT OnUpdateThreadStatus(WPARAM wParam, LPARAM lParam);
+	afx_msg void OnTimer(UINT_PTR nIDEvent);
+	void InitThreadList(UINT threadCount);
 	CEdit m_srcEdit;
 	CEdit m_destEdit;
 	std::unique_ptr<CCopyController> m_pCopyController;
@@ -48,4 +51,11 @@ public:
 	CListCtrl m_threadListCtrl;
 	CRichEditCtrl m_logRichEdit;
 	CString m_filesAllSizeText;
+
+private:
+	UINT_PTR m_nTimerID;           // 用于标识我们的定时器
+	DWORD    m_dwLastTickCount;    // 上次计算时的时间戳
+	ULONGLONG m_ullLastCopiedSize; // 上次计算时已复制的总字节数
+
+	CString FormatSize(ULONGLONG size); //用于格式化字节大小
 };

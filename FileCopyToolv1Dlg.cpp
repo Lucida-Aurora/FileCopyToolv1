@@ -69,6 +69,8 @@ BEGIN_MESSAGE_MAP(CFileCopyToolv1Dlg, CDialogEx)
 	ON_MESSAGE(WM_USER_PREPARATION_COMPLETE, &CFileCopyToolv1Dlg::OnPreparationComplete)
 	ON_MESSAGE(WM_USER_COPY_COMPLETE, &CFileCopyToolv1Dlg::OnCopyComplete)
 	ON_MESSAGE(WM_USER_LOG_MESSAGE, &CFileCopyToolv1Dlg::OnLogMessage)
+	ON_MESSAGE(WM_USER_UPDATE_THREAD_STATUS, &CFileCopyToolv1Dlg::OnUpdateThreadStatus)
+	ON_WM_TIMER()
 END_MESSAGE_MAP()
 
 // CFileCopyToolv1Dlg 消息处理程序
@@ -101,6 +103,13 @@ BOOL CFileCopyToolv1Dlg::OnInitDialog() {
 
 	// TODO: 在此添加额外的初始化代码
 	m_pCopyController = std::make_unique<CCopyController>();
+	// 设置扩展样式：显示网格线、整行选中
+	m_threadListCtrl.SetExtendedStyle(m_threadListCtrl.GetExtendedStyle() | LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+
+	// 添加列标题
+	m_threadListCtrl.InsertColumn(0, _T("线程ID"), LVCFMT_LEFT, 60);
+	m_threadListCtrl.InsertColumn(1, _T("状态"), LVCFMT_LEFT, 80);
+	m_threadListCtrl.InsertColumn(2, _T("当前文件"), LVCFMT_LEFT, 200);
 	return TRUE;  // 除非将焦点设置到控件，否则返回 TRUE
 }
 
@@ -108,7 +117,8 @@ void CFileCopyToolv1Dlg::OnSysCommand(UINT nID, LPARAM lParam) {
 	if ((nID & 0xFFF0) == IDM_ABOUTBOX) {
 		CAboutDlg dlgAbout;
 		dlgAbout.DoModal();
-	} else {
+	}
+	else {
 		CDialogEx::OnSysCommand(nID, lParam);
 	}
 }
@@ -133,7 +143,8 @@ void CFileCopyToolv1Dlg::OnPaint() {
 
 		// 绘制图标
 		dc.DrawIcon(x, y, m_hIcon);
-	} else {
+	}
+	else {
 		CDialogEx::OnPaint();
 	}
 }
@@ -171,11 +182,14 @@ LRESULT CFileCopyToolv1Dlg::OnPreparationComplete(WPARAM wParam, LPARAM lParam) 
 	ULONGLONG totalSize = static_cast<ULONGLONG>(lParam);
 	if (totalSize >= 1024 * 1024 * 1024) {
 		m_filesAllSizeText.Format(_T("%.2f GB"), totalSize / (1024.0 * 1024.0 * 1024.0));
-	} else if (totalSize >= 1024 * 1024) {
+	}
+	else if (totalSize >= 1024 * 1024) {
 		m_filesAllSizeText.Format(_T("%.2f MB"), totalSize / (1024.0 * 1024.0));
-	} else if (totalSize >= 1024) {
+	}
+	else if (totalSize >= 1024) {
 		m_filesAllSizeText.Format(_T("%.2f KB"), totalSize / 1024.0);
-	} else {
+	}
+	else {
 		m_filesAllSizeText.Format(_T("%u B"), totalSize);
 	}
 
@@ -194,6 +208,13 @@ LRESULT CFileCopyToolv1Dlg::OnPreparationComplete(WPARAM wParam, LPARAM lParam) 
 LRESULT CFileCopyToolv1Dlg::OnCopyComplete(WPARAM wParam, LPARAM lParam) {
 	// wParam 可以用来传递任务的最终状态，比如 0=成功, 1=用户取消, 2=发生错误
 	int finalStatus = static_cast<int>(wParam);
+	//销毁定时器
+	if (m_nTimerID != 0) {
+		KillTimer(m_nTimerID);
+		m_nTimerID = 0;
+	}
+	// 确保最后一次更新UI，显示100%
+	OnTimer(1); // 手动调用一次，刷新最终状态
 
 	switch (finalStatus) {
 	case 0:
@@ -241,19 +262,19 @@ LRESULT CFileCopyToolv1Dlg::OnLogMessage(WPARAM wParam, LPARAM lParam) {
 	}
 
 	// --- 向RichEdit控件追加带颜色的文本 ---
-	// CHARFORMAT2 cf;
-	// ZeroMemory(&cf, sizeof(CHARFORMAT2));
-	// cf.cbSize = sizeof(CHARFORMAT2);
-	// cf.dwMask = CFM_COLOR;
-	// cf.crTextColor = color;
+	CHARFORMAT2 cf;
+	ZeroMemory(&cf, sizeof(CHARFORMAT2));
+	cf.cbSize = sizeof(CHARFORMAT2);
+	cf.dwMask = CFM_COLOR;
+	cf.crTextColor = color;
 
-	// long nStart, nEnd;
-	// m_logEdit.GetSel(nStart, nEnd); // 获取当前文本长度
-	// m_logEdit.SetSel(nEnd, nEnd);   // 将光标移动到末尾
-	// m_logEdit.SetSelectionCharFormat(cf); // 设置新文本的格式
+	long nStart, nEnd;
+	m_logRichEdit.GetSel(nStart, nEnd); // 获取当前文本长度
+	m_logRichEdit.SetSel(nEnd, nEnd);   // 将光标移动到末尾
+	m_logRichEdit.SetSelectionCharFormat(cf); // 设置新文本的格式
 
-	// CString logLine = pLogMsg->text + _T("\r\n");
-	// m_logEdit.ReplaceSel(logLine); // 追加文本
+	CString logLine = pLogMsg->text + _T("\r\n");
+	m_logRichEdit.ReplaceSel(logLine); // 追加文本
 
 	// 关键：释放后台线程分配的内存，防止内存泄漏！
 	delete pLogMsg;
@@ -261,9 +282,109 @@ LRESULT CFileCopyToolv1Dlg::OnLogMessage(WPARAM wParam, LPARAM lParam) {
 	return 0;
 }
 
+LRESULT CFileCopyToolv1Dlg::OnUpdateThreadStatus(WPARAM wParam, LPARAM lParam) {
+	SThreadStatusInfo* pInfo = reinterpret_cast<SThreadStatusInfo*>(lParam);
+	if (pInfo) {
+		// threadId是从1开始的，而列表索引是从0开始的
+		int itemIndex = static_cast<int>(pInfo->threadId) - 1;
+
+		if (itemIndex >= 0 && itemIndex < m_threadListCtrl.GetItemCount()) {
+			m_threadListCtrl.SetItemText(itemIndex, 1, pInfo->statusText);
+			m_threadListCtrl.SetItemText(itemIndex, 2, pInfo->currentFile);
+		}
+		delete pInfo; // 释放后台线程分配的内存
+	}
+	return 0;
+}
+
+void CFileCopyToolv1Dlg::OnTimer(UINT_PTR nIDEvent) {
+	if (nIDEvent != m_nTimerID && nIDEvent != 1) {
+		CDialogEx::OnTimer(nIDEvent);
+	}
+	if (!m_pCopyController) return;
+	const SSharedStats& stats = m_pCopyController->GetSharedStats();
+	ULONGLONG totalSize = stats.totalCopySize;
+	ULONGLONG copiedSize = stats.totalBytesCopied;
+	UINT totalFiles = stats.totalFileCount;
+	UINT copiedFiles = stats.completedFileCount + stats.failedFileCount;
+	int progress = 0;
+	if (totalSize > 0) {
+		progress = static_cast<int>((copiedSize * 100) / totalSize);
+	}
+	m_progressBar.SetPos(progress);
+	CString progressText;
+	progressText.Format(_T("%d%%"), progress);
+	m_totalProgressText.SetWindowText(progressText);
+	DWORD currentTick = GetTickCount();
+	DWORD elapsedTime = currentTick - m_dwLastTickCount;
+	if (elapsedTime > 0) {
+		ULONGLONG deltaSize = copiedSize - m_ullLastCopiedSize;
+		double speed = (deltaSize / static_cast<double>(elapsedTime)) * 1000.0;
+		CString speedText;
+		speedText.Format(_T("%.2f MB/s"), speed / (1024.0 * 1024.0));
+		m_totalSpeedText.SetWindowText(speedText);
+		if (speed > 0) {
+			ULONGLONG remainingSize = totalSize - copiedSize;
+			double remainingTimeSec = remainingSize / speed;
+			CString timeText;
+			timeText.Format(_T("%d s"), static_cast<int>(remainingTimeSec));
+			m_remainTimeText.SetWindowText(timeText);
+		}
+		else {
+			m_remainTimeText.SetWindowText(_T("N/A"));
+		}
+	}
+	// 更新下一次计算的基准值
+	m_dwLastTickCount = currentTick;
+	m_ullLastCopiedSize = copiedSize;
+
+	// 4. 更新已复制文本
+	CString alreadyCopyText;
+	alreadyCopyText.Format(_T("%s / %s (%u/%u个)"), FormatSize(copiedSize), FormatSize(totalSize), copiedFiles, totalFiles);
+	m_alreadyCopyText.SetWindowText(alreadyCopyText);
+
+	CDialogEx::OnTimer(nIDEvent);
+}
+
+void CFileCopyToolv1Dlg::InitThreadList(UINT threadCount) {
+	m_threadListCtrl.DeleteAllItems(); // 清空旧数据
+	for (UINT i = 0; i < threadCount; ++i) {
+		CString threadIdStr;
+		threadIdStr.Format(_T("%u"), i + 1);
+		m_threadListCtrl.InsertItem(i, threadIdStr); // 插入新行，只填第一列
+		m_threadListCtrl.SetItemText(i, 1, _T("等待中...")); // 设置第二列“状态”
+		m_threadListCtrl.SetItemText(i, 2, _T("N/A"));      // 设置第三列“当前文件”
+	}
+}
+
 void CFileCopyToolv1Dlg::OnBnClickedButtonStartcopy() {
 	CString srcPath, destPath;
 	m_srcEdit.GetWindowText(srcPath);
 	m_destEdit.GetWindowText(destPath);
-	m_pCopyController->StartCopy(srcPath, destPath, this->m_hWnd, 8);
+	UINT threadCount = 8; // 线程数可以从UI获取
+
+	// 在启动后台任务前，先初始化好我们的“仪表盘”
+	InitThreadList(threadCount);
+	if (m_pCopyController->StartCopy(srcPath, destPath, this->m_hWnd, 8)) {
+		m_dwLastTickCount = GetTickCount();
+		m_ullLastCopiedSize = 0;
+		m_nTimerID = SetTimer(1, 500, nullptr);
+	}
+}
+
+CString CFileCopyToolv1Dlg::FormatSize(ULONGLONG size) {
+	CString strSize;
+	if (size >= 1024 * 1024 * 1024) { // GB
+		strSize.Format(_T("%.2f GB"), size / (1024.0 * 1024.0 * 1024.0));
+	}
+	else if (size >= 1024 * 1024) { // MB
+		strSize.Format(_T("%.2f MB"), size / (1024.0 * 1024.0));
+	}
+	else if (size >= 1024) { // KB
+		strSize.Format(_T("%.2f KB"), size / 1024.0);
+	}
+	else { // B
+		strSize.Format(_T("%llu B"), size);
+	}
+	return strSize;
 }
