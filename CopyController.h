@@ -17,6 +17,13 @@ enum class ECopyStatus {
 	Error        // 发生致命错误
 };
 
+// 为每个线程的每个文件复制操作创建一个独立的上下文
+// 这个结构体会被传递给 CopyFileEx 的回调函数
+struct SCopyProgressContext {
+	SSharedStats* pSharedStats;
+	ULONGLONG lastCopied; // 这个文件开始复制前，已经复制的总字节数
+};
+
 struct SThreadParam {
 	UINT threadId;  //线程ID, 主要用户日志记录
 	HWND hNotifyWnd; //通知窗口句柄, 用户PostMessage通知UI更新
@@ -32,14 +39,13 @@ class CCopyController {
 	HWND m_hNotifyWnd; // 通知窗口句柄
 
 	std::atomic<ECopyStatus> m_status{ ECopyStatus::Idle }; // 当前任务状态
-	std::atomic<bool> m_bCancelSignal{ false }; // 是否取消复制
+	BOOL m_bCancelSignal{ FALSE }; // 是否取消复制
 	HANDLE m_hResumeEvent;
 	SSharedStats m_sharedStats; // 共享统计信息
 	std::vector<SFileInfo> m_allFiles; // 待复制文件列表
 	std::vector<std::vector<SFileInfo*>> m_threadFileLists; // 每个线程的文件列表
 	std::vector<SThreadParam*> m_threadParams; // 线程参数列表
 	std::vector<CWinThread*> m_threads; // 线程列表
-	std::vector<HANDLE> m_threadCompletedEvents; // 线程列表
 public:
 	CCopyController();
 	~CCopyController();
@@ -60,5 +66,14 @@ private:
 	void _Cleanup();
 	static UINT AFX_CDECL PreparationThreadProc(LPVOID param);
 	static UINT AFX_CDECL CopyWorkerThreadProc(LPVOID param);
-	static UINT AFX_CDECL MonitorCompleteThreadProc(LPVOID param);
+	static DWORD CALLBACK CopyProgressRoutine(
+		LARGE_INTEGER TotalFileSize,
+		LARGE_INTEGER TotalBytesTransferred,
+		LARGE_INTEGER StreamSize,
+		LARGE_INTEGER StreamBytesTransferred,
+		DWORD dwStreamNumber,
+		DWORD dwCallbackReason,
+		HANDLE hSourceFile,
+		HANDLE hDestinationFile,
+		LPVOID lpData);
 };

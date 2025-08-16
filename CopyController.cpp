@@ -22,13 +22,8 @@ bool CCopyController::StartCopy(const CString& source, const CString& dest, HWND
 	m_hNotifyWnd = wnd;
 	m_threadCount = threadCount > 0 ? threadCount : 1;
 	m_status.store(ECopyStatus::Preparing);
-	m_threadCompletedEvents.resize(m_threadCount);
-	for (int i = 0; i < m_threadCount; i++) {
-		m_threadCompletedEvents[i] = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-	}
 	// 创建准备线程
 	AfxBeginThread(PreparationThreadProc, this);
-	AfxBeginThread(MonitorCompleteThreadProc, this);
 	return true;
 }
 
@@ -47,7 +42,7 @@ void CCopyController::ResumeCopy() {
 }
 
 void CCopyController::CancelCopy() {
-	m_bCancelSignal.store(true);
+	m_bCancelSignal = TRUE;
 	if (m_status.load() == ECopyStatus::Paused) {
 		ResumeCopy();
 	}
@@ -180,9 +175,9 @@ void CCopyController::_LaunchWorkerThreads() {
 }
 
 void CCopyController::_Cleanup() {
-	for (int i = 0; i < m_threadCount; i++) {
-		SetEvent(m_threadCompletedEvents[i]);
-	}
+	//for (int i = 0; i < m_threadCount; i++) {
+	//	SetEvent(m_threadCompletedEvents[i]);
+	//}
 	for (CWinThread* pThread : m_threads) {
 		if (pThread) {
 			WaitForSingleObject(pThread->m_hThread, INFINITE);
@@ -225,7 +220,7 @@ UINT CCopyController::CopyWorkerThreadProc(LPVOID param) {
 	PostMessage(hNotifyWnd, WM_USER_LOG_MESSAGE, 0, reinterpret_cast<LPARAM>(pLogStart));
 	for (SFileInfo* pFile : *pThreadParam->pFilesToCopy) {
 		WaitForSingleObject(pController->m_hResumeEvent, INFINITE);
-		if (pController->m_bCancelSignal.load()) break;
+		if (pController->m_bCancelSignal) break;
 		pFile->status.store(EFileStatus::InProgress);
 
 		CString fileName = PathFindFileName(pFile->sourcePath);
@@ -235,10 +230,19 @@ UINT CCopyController::CopyWorkerThreadProc(LPVOID param) {
 		logMsg += fileName;
 		LogMessage* pLogCopy = new LogMessage{ logMsg, ELogLevel::Info };
 		PostMessage(hNotifyWnd, WM_USER_LOG_MESSAGE, 0, reinterpret_cast<LPARAM>(pLogCopy));
-		if (CopyFile(pFile->sourcePath, pFile->destPath, FALSE)) {
+		SCopyProgressContext progressCtx;
+		progressCtx.pSharedStats = pSharedStats;
+		progressCtx.lastCopied = 0;
+		BOOL bSuccess = CopyFileEx(
+			pFile->sourcePath,
+			pFile->destPath,
+			(LPPROGRESS_ROUTINE)CopyProgressRoutine, // 我们的回调函数
+			&progressCtx,                            // 传递本次复制的独立上下文
+			&(pController->m_bCancelSignal),         // 传递取消信号的地址
+			0);                                      // 默认标志
+		if (bSuccess) {
 			pFile->status.store(EFileStatus::Completed);
 			++pSharedStats->completedFileCount;
-			pSharedStats->totalBytesCopied += pFile->fileSize;
 			LogMessage* pLogSuccess = new LogMessage{ fileName + _T(" 复制成功。"), ELogLevel::Success };
 			PostMessage(hNotifyWnd, WM_USER_LOG_MESSAGE, 0, reinterpret_cast<LPARAM>(pLogSuccess));
 		}
@@ -251,17 +255,25 @@ UINT CCopyController::CopyWorkerThreadProc(LPVOID param) {
 	}
 	SThreadStatusInfo* pStatusDone = new SThreadStatusInfo{ threadId, L"完成", L"" };
 	PostMessage(hNotifyWnd, WM_USER_UPDATE_THREAD_STATUS, 0, reinterpret_cast<LPARAM>(pStatusDone));
-	--pSharedStats->activeCopyThreads;
-	SetEvent(pController->m_threadCompletedEvents[pThreadParam->threadId - 1]);
+	if (pSharedStats->activeCopyThreads.fetch_sub(1) == 1) {
+		PostMessage(hNotifyWnd, WM_USER_COPY_COMPLETE, 0, 0);
+	}
 	delete pThreadParam;
 	return 0;
 }
 
-UINT CCopyController::MonitorCompleteThreadProc(LPVOID param) {
-	CCopyController* pThis = static_cast<CCopyController*>(param);
-	DWORD dwRet = WaitForMultipleObjects(pThis->m_threadCount, pThis->m_threadCompletedEvents.data(), TRUE, INFINITE);
-	if (dwRet == WAIT_OBJECT_0) {
-		PostMessage(pThis->m_hNotifyWnd, WM_USER_COPY_COMPLETE, 0, 0);
+DWORD CCopyController::CopyProgressRoutine(LARGE_INTEGER TotalFileSize, LARGE_INTEGER TotalBytesTransferred,
+	LARGE_INTEGER StreamSize, LARGE_INTEGER StreamBytesTransferred, DWORD dwStreamNumber, DWORD dwCallbackReason,
+	HANDLE hSourceFile, HANDLE hDestinationFile, LPVOID lpData) {
+	SCopyProgressContext* pContext = static_cast<SCopyProgressContext*>(lpData);
+	if (pContext && pContext->pSharedStats) {
+		// 实时更新全局已复制字节数
+		// 当前总进度 = 这个文件开始前的总进度 + 这个文件当前已经复制的进度
+		pContext->pSharedStats->totalBytesCopied.store(
+			pContext->pSharedStats->totalBytesCopied.load() +
+			TotalBytesTransferred.QuadPart - pContext->lastCopied
+		);
+		pContext->lastCopied = TotalBytesTransferred.QuadPart;
 	}
-	return 0;
+	return PROGRESS_CONTINUE;
 }
